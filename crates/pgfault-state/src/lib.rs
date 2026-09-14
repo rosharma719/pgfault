@@ -415,7 +415,10 @@ mod tests {
         s.backend(&frame(b'1', b""));
         s.backend(&frame(b'2', b""));
         s.backend(&frame(b'C', b"INSERT 0 1\0"));
-        assert!(s.backend(&frame(b'Z', b"T")).iter().all(|ev| ev.semantic_reliable));
+        assert!(s
+            .backend(&frame(b'Z', b"T"))
+            .iter()
+            .all(|ev| ev.semantic_reliable));
 
         s.frontend(&frame(b'Q', b"COMMIT\0"));
         assert_eq!(

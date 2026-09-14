@@ -1,0 +1,20 @@
+# For testing extensions that open their own outbound connections
+# (postgres_fdw, dblink, Citus-style coordinator->worker links): point the
+# remote/foreign side's connection string at pgfault instead of the real
+# target, tagging it with a distinct application_name so this scenario only
+# fires on that leg and not on ordinary client traffic, e.g. for postgres_fdw:
+#   CREATE SERVER remote FOREIGN DATA WRAPPER postgres_fdw
+#     OPTIONS (host '127.0.0.1', port '15432', application_name 'fdw-remote-test');
+version: 1
+name: remote-leg-ambiguous-commit
+match:
+  application_name: fdw-remote-test
+when:
+  event: transaction.commit.completed
+  occurrence: 1
+action:
+  suppress:
+    current: true
+  disconnect:
+    side: frontend
+    mode: reset

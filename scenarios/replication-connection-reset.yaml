@@ -1,0 +1,22 @@
+# For testing logical replication and extensions built on it (pglogical,
+# BDR-style setups): a replication connection is a long-lived COPY BOTH
+# stream, so pgfault's semantic parser doesn't decode its WAL messages -- but
+# it relays them transparently regardless, and the connection still goes
+# through the normal startup handshake before that stream begins. This fires
+# right after that handshake, severing the connection immediately after
+# replication starts, to check whether the subscriber correctly resumes from
+# the last confirmed LSN rather than duplicating or losing changes. Point the
+# subscription's connection string at pgfault and tag it, e.g.:
+#   CREATE SUBSCRIPTION sub CONNECTION
+#     'host=127.0.0.1 port=15432 application_name=replication-test' PUBLICATION pub;
+version: 1
+name: replication-connection-reset
+match:
+  application_name: replication-test
+when:
+  event: connection.ready
+  occurrence: 1
+action:
+  disconnect:
+    side: upstream
+    mode: reset

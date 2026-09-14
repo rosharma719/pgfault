@@ -33,3 +33,4 @@ jobs:
       - run: pip install 'psycopg[binary]==3.3.5'
       - run: python scripts/integration.py
       - run: python scripts/driver_matrix.py
+      - run: python scripts/tls_check.py

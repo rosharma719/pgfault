@@ -51,6 +51,7 @@ async fn fixture(
         upstream: upstream.local_addr().unwrap().to_string(),
         scenarios,
         trace,
+        tls: Default::default(),
     };
     let (tx, rx) = oneshot::channel();
     let task = tokio::spawn(async move {

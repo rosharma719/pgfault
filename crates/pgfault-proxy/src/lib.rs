@@ -9,15 +9,19 @@ use pgfault_wire::{
 };
 use std::{future::Future, net::SocketAddr, time::Duration};
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     task::JoinSet,
 };
+mod tls;
+use tls::Stream;
+pub use tls::{frontend_acceptor, upstream_connector, TlsConfig};
 #[derive(Clone)]
 pub struct Config {
     pub upstream: String,
     pub scenarios: Vec<Scenario>,
     pub trace: Recorder,
+    pub tls: TlsConfig,
 }
 /// Each accepted client owns exactly one upstream and isolated semantic/fault state.
 pub async fn serve(
@@ -75,14 +79,24 @@ fn metadata(packet: &[u8]) -> Result<StartupMetadata> {
     }
     Ok(m)
 }
-async fn connection(mut frontend: TcpStream, config: &Config, id: u64) -> Result<()> {
+async fn connection(frontend: TcpStream, config: &Config, id: u64) -> Result<()> {
     frontend.set_nodelay(true)?;
+    let mut frontend = Stream::plain(frontend);
     let packet = loop {
         let packet =
             tokio::time::timeout(Duration::from_secs(30), startup(&mut frontend)).await??;
         let code = u32::from_be_bytes(packet[4..8].try_into().unwrap());
         match code {
-            SSL_REQUEST|GSS_REQUEST=> {if packet.len()!=8 {bail!("invalid negotiation request");}frontend.write_all(b"N").await?;}
+            SSL_REQUEST => {
+                if packet.len()!=8 {bail!("invalid negotiation request");}
+                if let Some(acceptor) = &config.tls.frontend {
+                    frontend.write_all(b"S").await?;
+                    frontend = tls::accept(frontend.into_plain(), acceptor).await?;
+                } else {
+                    frontend.write_all(b"N").await?;
+                }
+            }
+            GSS_REQUEST=> {if packet.len()!=8 {bail!("invalid negotiation request");}frontend.write_all(b"N").await?;}
             CANCEL_REQUEST=> {
                 if packet.len()!=16 {bail!("invalid cancellation request");}
                 let mut upstream=TcpStream::connect(&config.upstream).await?;
@@ -94,10 +108,32 @@ async fn connection(mut frontend: TcpStream, config: &Config, id: u64) -> Result
         }
     };
     let meta = metadata(&packet)?;
-    let mut upstream = TcpStream::connect(&config.upstream)
+    let mut upstream_tcp = TcpStream::connect(&config.upstream)
         .await
         .context("connecting upstream")?;
-    upstream.set_nodelay(true)?;
+    upstream_tcp.set_nodelay(true)?;
+    let mut upstream = if let Some(connector) = &config.tls.upstream {
+        let mut request = Vec::with_capacity(8);
+        request.extend_from_slice(&8u32.to_be_bytes());
+        request.extend_from_slice(&SSL_REQUEST.to_be_bytes());
+        upstream_tcp.write_all(&request).await?;
+        let mut reply = [0u8; 1];
+        upstream_tcp
+            .read_exact(&mut reply)
+            .await
+            .context("reading upstream SSLRequest reply")?;
+        if reply[0] != b'S' {
+            bail!("upstream does not support TLS (--upstream-tls was set)");
+        }
+        let host = config
+            .upstream
+            .rsplit_once(':')
+            .map_or(config.upstream.as_str(), |(h, _)| h);
+        let name = tls::server_name(host)?;
+        tls::connect(upstream_tcp, connector, name).await?
+    } else {
+        Stream::plain(upstream_tcp)
+    };
     upstream.write_all(&packet).await?;
     let mut state = ConnectionState::new(id, meta);
     config.trace.lifecycle(id, "startup", "")?;
@@ -130,7 +166,7 @@ async fn connection(mut frontend: TcpStream, config: &Config, id: u64) -> Result
                 if d.disconnect {return Ok(());}
                 // A result truncation delivers exactly N complete rows, then closes before row N+1.
                 let cut=if f.tag()==b'D' {if let Some(left)=truncate.as_mut() {if *left==0 {true} else {*left-=1;false}} else {false}} else {false};
-                if cut {reset(&frontend)?;config.trace.lifecycle(id,"result.truncated","")?;return Ok(());}
+                if cut {frontend.reset()?;config.trace.lifecycle(id,"result.truncated","")?;return Ok(());}
                 if f.tag()==b'Z' {
                     if !d.suppress {for bytes in held.drain(..) {frontend.write_all(&bytes).await?;}frontend.write_all(&f.0).await?;} else {held.clear();}
                     held_size=0;truncate=None;
@@ -140,14 +176,10 @@ async fn connection(mut frontend: TcpStream, config: &Config, id: u64) -> Result
                         held.push(f.0.clone());
                     } else {frontend.write_all(&f.0).await?;}
                 }
-                if f.tag()==b'D' && truncate==Some(0) {reset(&frontend)?;config.trace.lifecycle(id,"result.truncated","")?;return Ok(());}
+                if f.tag()==b'D' && truncate==Some(0) {frontend.reset()?;config.trace.lifecycle(id,"result.truncated","")?;return Ok(());}
             }
         }
     }
-}
-fn reset(socket: &TcpStream) -> Result<()> {
-    socket2::SockRef::from(socket).set_linger(Some(Duration::ZERO))?;
-    Ok(())
 }
 #[derive(Default)]
 struct Disposition {
@@ -158,8 +190,8 @@ async fn apply(
     events: Vec<Event>,
     matchers: &mut [Matcher],
     trace: &Recorder,
-    frontend: &mut TcpStream,
-    upstream: &mut TcpStream,
+    frontend: &mut Stream,
+    upstream: &mut Stream,
     truncate: &mut Option<u64>,
 ) -> Result<Disposition> {
     let mut d = Disposition::default();
@@ -171,7 +203,7 @@ async fn apply(
             }
             trace.record(Record::Fault {
                 coordinate: e.clone(),
-                scenario: m.scenario.clone(),
+                scenario: Box::new(m.scenario.clone()),
             })?;
             tracing::info!(connection_id=e.connection_id,event=%e.event,scenario=%m.scenario.name,"FAULT FIRED");
             let Action {
@@ -195,7 +227,7 @@ async fn apply(
                     Side::Upstream => &mut *upstream,
                 };
                 match disconnect.mode {
-                    Mode::Reset => reset(socket)?,
+                    Mode::Reset => socket.reset()?,
                     Mode::Close => socket.shutdown().await?,
                 }
                 d.disconnect = true;

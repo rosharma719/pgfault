@@ -1,6 +1,6 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
-use pgfault_proxy::{bind, serve, Config};
+use clap::{Args, Parser, Subcommand};
+use pgfault_proxy::{bind, frontend_acceptor, serve, upstream_connector, Config, TlsConfig};
 use pgfault_scenario::Scenario;
 use pgfault_trace::Recorder;
 use std::path::PathBuf;
@@ -14,6 +14,37 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 }
+#[derive(Args, Clone)]
+struct TlsArgs {
+    /// Terminate TLS from clients using this certificate (PEM). Requires --tls-key.
+    #[arg(long, requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+    /// Private key (PEM) matching --tls-cert.
+    #[arg(long, requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+    /// Negotiate TLS to the upstream PostgreSQL server; fails if it declines.
+    #[arg(long)]
+    upstream_tls: bool,
+    /// Skip verifying the upstream server's TLS certificate (testing only).
+    #[arg(long, requires = "upstream_tls")]
+    upstream_tls_insecure: bool,
+    /// Extra CA certificate (PEM) to trust when verifying the upstream server.
+    #[arg(long, requires = "upstream_tls")]
+    upstream_ca: Option<PathBuf>,
+}
+impl TlsArgs {
+    fn into_config(self) -> Result<TlsConfig> {
+        let frontend = match (self.tls_cert, self.tls_key) {
+            (Some(cert), Some(key)) => Some(frontend_acceptor(&cert, &key)?),
+            _ => None,
+        };
+        let upstream = self
+            .upstream_tls
+            .then(|| upstream_connector(self.upstream_tls_insecure, self.upstream_ca.as_deref()))
+            .transpose()?;
+        Ok(TlsConfig { frontend, upstream })
+    }
+}
 #[derive(Subcommand)]
 enum Command {
     /// Relay PostgreSQL unchanged, optionally injecting semantic faults.
@@ -26,6 +57,8 @@ enum Command {
         scenario: Vec<PathBuf>,
         #[arg(long)]
         trace: Option<PathBuf>,
+        #[command(flatten)]
+        tls: TlsArgs,
     },
     /// Recreate fired faults at their recorded semantic coordinates.
     Replay {
@@ -36,6 +69,8 @@ enum Command {
         upstream: String,
         #[arg(long)]
         output_trace: Option<PathBuf>,
+        #[command(flatten)]
+        tls: TlsArgs,
     },
     /// Parse and validate a scenario without opening any sockets.
     Validate { scenario: PathBuf },
@@ -48,7 +83,7 @@ async fn main() -> Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
-    let (listen, upstream, scenarios, trace) = match Cli::parse().command {
+    let (listen, upstream, scenarios, trace, tls) = match Cli::parse().command {
         Command::Validate { scenario } => {
             let s = Scenario::load(scenario)?;
             println!("valid: {}", s.name);
@@ -59,6 +94,7 @@ async fn main() -> Result<()> {
             upstream,
             scenario,
             trace,
+            tls,
         } => (
             listen,
             upstream,
@@ -67,19 +103,23 @@ async fn main() -> Result<()> {
                 .map(Scenario::load)
                 .collect::<Result<Vec<_>>>()?,
             trace,
+            tls,
         ),
         Command::Replay {
             trace,
             listen,
             upstream,
             output_trace,
+            tls,
         } => (
             listen,
             upstream,
             pgfault_trace::replay(trace)?,
             output_trace,
+            tls,
         ),
     };
+    let tls = tls.into_config()?;
     let path = trace.unwrap_or_else(|| {
         PathBuf::from(format!(
             ".pgfault/traces/{}-{}.jsonl",
@@ -99,6 +139,7 @@ async fn main() -> Result<()> {
             upstream,
             scenarios,
             trace: recorder,
+            tls,
         },
         async {
             #[cfg(unix)]

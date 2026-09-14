@@ -17,7 +17,7 @@ pub enum Record {
     },
     Fault {
         coordinate: Event,
-        scenario: Scenario,
+        scenario: Box<Scenario>,
     },
     Lifecycle {
         connection_id: u64,
@@ -80,7 +80,7 @@ pub fn replay(path: impl AsRef<Path>) -> Result<Vec<Scenario>> {
             scenario.when.row = e.row_index;
             scenario.validate()?;
             if unique.insert(serde_json::to_string(&scenario)?) {
-                schedules.push(scenario);
+                schedules.push(*scenario);
             }
         }
     }
