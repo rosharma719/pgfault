@@ -10,6 +10,12 @@ The bug class this is built around: a client sends `COMMIT`, PostgreSQL applies 
 
 pgfault reproduces it on demand, byte-for-byte, every time. The `ambiguous-commit` scenario ships as the canonical proof: it holds the `CommandComplete("COMMIT")` frame until PostgreSQL has confirmed (via `ReadyForQuery`) that the transaction is idle and durable, *then* resets the client connection. The row is verifiably there; the client verifiably got a connection error. This is checked byte-for-byte against a real PostgreSQL server, not mocked, across `psql`, `psycopg`, Go's `pgx`, and Java's `pgjdbc`.
 
+## Case studies
+
+Real gaps found in real, widely-used open-source projects by pointing pgfault at them:
+
+- [**golang-migrate**](case-studies/golang-migrate-ambiguous-commit/) — an ambiguous commit during golang-migrate's own internal version-bookkeeping (not the migration itself) permanently locks it out of the database with `Dirty database version N. Fix and force version.`, requiring manual intervention, even though zero migration content was ever at risk. Fully reproducible with one script against a real PostgreSQL server.
+
 ## Testing PostgreSQL extensions
 
 pgfault doesn't care which side of a connection is "the app." Anything that speaks the PostgreSQL wire protocol can be pointed at it — including PostgreSQL itself. A lot of the most interesting extension bugs live exactly in the connections **PostgreSQL opens as a client**:

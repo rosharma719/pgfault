@@ -1,0 +1,16 @@
+# Targets golang-migrate's SECOND bookkeeping commit: `SetVersion(version,
+# dirty=false)`, run *after* the migration body has already applied
+# successfully. Same fault, same mechanism as dirty-flag-lost-ack.yaml, but
+# aimed one commit later -- included to show the outcome is state-dependent:
+# this one happens to leave the database genuinely clean.
+version: 1
+name: clean-finish-lost-ack
+when:
+  event: transaction.commit.completed
+  occurrence: 2
+action:
+  suppress:
+    current: true
+  disconnect:
+    side: frontend
+    mode: reset

@@ -1,0 +1,16 @@
+# Targets golang-migrate's FIRST bookkeeping commit for a migration: the
+# `SetVersion(version, dirty=true)` transaction it runs *before* executing
+# the migration body. Holds that COMMIT's acknowledgement until PostgreSQL
+# confirms it landed, then severs the connection -- reproducing "the ack
+# was lost on an otherwise-successful commit" deterministically.
+version: 1
+name: dirty-flag-lost-ack
+when:
+  event: transaction.commit.completed
+  occurrence: 1
+action:
+  suppress:
+    current: true
+  disconnect:
+    side: frontend
+    mode: reset
