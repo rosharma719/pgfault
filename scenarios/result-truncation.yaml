@@ -1,0 +1,7 @@
+version: 1
+name: partial-select
+when:
+  event: result.started
+action:
+  truncate_result:
+    after_rows: 37

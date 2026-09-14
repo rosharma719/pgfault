@@ -1,0 +1,9 @@
+[package]
+name = "pgfault-state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pgfault-wire = { path = "../pgfault-wire" }
+pgfault-events = { path = "../pgfault-events" }

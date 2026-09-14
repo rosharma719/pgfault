@@ -1,0 +1,9 @@
+version: 1
+name: write-response-delay
+when:
+  event: statement.execution_completed
+  statement_class: [insert, update, delete]
+action:
+  delay:
+    direction: downstream
+    duration: 10s

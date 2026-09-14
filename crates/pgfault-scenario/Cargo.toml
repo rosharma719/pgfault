@@ -1,0 +1,12 @@
+[package]
+name = "pgfault-scenario"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_yaml.workspace = true
+anyhow.workspace = true
+humantime.workspace = true
+pgfault-events = { path = "../pgfault-events" }

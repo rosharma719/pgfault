@@ -1,0 +1,13 @@
+version: 1
+name: ambiguous-commit
+match:
+  application_name: checkout-test
+when:
+  event: transaction.commit.completed
+  occurrence: 1
+action:
+  suppress:
+    current: true
+  disconnect:
+    side: frontend
+    mode: reset

@@ -1,0 +1,5 @@
+/target/
+/.pgfault/
+/.venv/
+__pycache__/
+*.class

@@ -1,0 +1,19 @@
+[package]
+name = "pgfault-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pgfault"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+pgfault-proxy = { path = "../pgfault-proxy" }
+pgfault-scenario = { path = "../pgfault-scenario" }
+pgfault-trace = { path = "../pgfault-trace" }
