@@ -71,9 +71,6 @@ impl ConnectionState {
                 ..Cycle::default()
             });
         }
-        if self.cycles.len() > 1 {
-            self.reliable = false;
-        }
         self.cycles.back_mut().unwrap()
     }
     fn event(&mut self, name: &str, front: bool) -> Event {
@@ -394,6 +391,39 @@ mod tests {
         s.frontend(&frame(b'Q', b"COMMIT\0"));
         s.backend(&frame(b'C', b"ROLLBACK\0"));
         assert!(!s
+            .backend(&frame(b'Z', b"I"))
+            .iter()
+            .any(|e| e.event == "transaction.commit.completed"));
+    }
+    #[test]
+    fn pipelined_begin_and_extended_statement_stays_reliable() {
+        // JDBC sends the implicit BEGIN as a simple query, then pipelines the
+        // extended-protocol Parse/Bind/Execute/Sync for the first statement
+        // without waiting for BEGIN's ReadyForQuery. Postgres still processes
+        // and replies to both in strict FIFO order, so this is unambiguous
+        // and must not be treated as unreliable.
+        let mut s = state();
+        s.frontend(&frame(b'Q', b"BEGIN\0"));
+        s.frontend(&frame(b'P', b"\0INSERT INTO x VALUES($1)\0\0\0"));
+        s.frontend(&frame(b'B', b"\0\0\0\0\0\0\0\0"));
+        let e = s.frontend(&frame(b'E', b"\0\0\0\0\0"));
+        assert!(e.iter().all(|ev| ev.semantic_reliable));
+        s.frontend(&frame(b'S', b""));
+
+        s.backend(&frame(b'C', b"BEGIN\0"));
+        s.backend(&frame(b'Z', b"T"));
+        s.backend(&frame(b'1', b""));
+        s.backend(&frame(b'2', b""));
+        s.backend(&frame(b'C', b"INSERT 0 1\0"));
+        assert!(s.backend(&frame(b'Z', b"T")).iter().all(|ev| ev.semantic_reliable));
+
+        s.frontend(&frame(b'Q', b"COMMIT\0"));
+        assert_eq!(
+            s.completion_boundary(&frame(b'C', b"COMMIT\0")),
+            Some("transaction.commit.completed")
+        );
+        s.backend(&frame(b'C', b"COMMIT\0"));
+        assert!(s
             .backend(&frame(b'Z', b"I"))
             .iter()
             .any(|e| e.event == "transaction.commit.completed"));
