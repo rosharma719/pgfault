@@ -200,4 +200,31 @@ Apply with `git apply case-studies/patches/goose-v3.28.0-runsqlmigration-ambiguo
 
 ---
 
+## 4. Flyway — bookkeeping-commit ambiguity confirmed harmless; a real pgfault DSL limitation surfaced while testing the other half
+
+**Status:** no fix needed for what was tested; one half couldn't be tested at all with the current scenario DSL (see limitation below).
+**Target:** `org.flywaydb:flyway-core` + `flyway-database-postgresql`, verified against `13.6.0`, driven directly via the Java API (no separate CLI distribution needed).
+
+### Architecture
+
+Flyway is more fragmented than either tool above: it uses **two separate JDBC connections** for one `migrate()` call. Connection A acquires an advisory lock, creates `flyway_schema_history` if needed, and does validation. Connection B — opened, used, and closed independently — executes the migration's actual SQL (`CREATE TABLE` + `INSERT`, committed together in one transaction). Only after connection B has fully closed does connection A insert **one** row into `flyway_schema_history` recording the outcome (`success=true`), in its own separate commit.
+
+Unlike golang-migrate, there's no pre-emptive "mark dirty before doing the work" write — the history row is written once, after the fact, already reflecting the final known outcome. That structural difference matters for what an ambiguous commit can actually do.
+
+### What was tested and found
+
+Targeting the bookkeeping commit (connection A's `INSERT INTO flyway_schema_history`): it durably succeeds (`success=true` row present), but Flyway reports `FlywaySqlException: Unable to commit transaction` plus a cascade of secondary "connection has been closed" errors (same shape as golang-migrate's "bad connection" cascade — a session-pinned connection dying mid-sequence and breaking the next calls on it), and exits 1.
+
+**A fresh retry self-heals cleanly**: `Schema "public" is up to date. No migration necessary.`, exit 0, `success=true migrationsExecuted=0`. No `repair` step needed, no lockout — because the single already-true history row is exactly what a fresh validation expects to see. Same shape of outcome as goose's finding (#3): the reported error on the run that actually succeeded is wrong, but nothing is left inconsistent. Not filing a fix for this specific case; it isn't causing operational harm.
+
+### What couldn't be tested: a real pgfault limitation
+
+The genuinely interesting question is the mirror image: what if the ambiguous commit hits connection B (the migration **content** commit) instead — does Flyway correctly detect on retry that the content already applied, or does it try to re-run the same SQL and hit `relation "poc_accounts" already exists`? This is exactly the kind of case worth checking, since Flyway's disambiguation logic covers "is `flyway_schema_history` in a state I understand," not "did the DDL I'm about to (re-)run already happen."
+
+It couldn't be isolated with pgfault's current scenario DSL. Scenarios match `occurrence` **per connection** (each connection gets its own independent counter from a fresh `Matcher`), and there's no selector for "the Nth connection this proxy has seen" or anything else that distinguishes connection A from connection B when both share the same `application_name`/`user`/`database` (as they do here — Flyway doesn't let you configure them differently per internal connection). Any `occurrence: N` scenario fires on whichever connection reaches N first, which in this trace is always connection A, since it opens first and does more work before connection B ever connects.
+
+**Candidate fix for pgfault itself:** add a connection-scoping selector to the scenario DSL — e.g. `match.connection_ordinal: 2` (the Nth connection accepted by this proxy instance) — so a scenario can target "whichever connection is the second one opened," independent of any field the target tool sets. This is a real gap in the tool surfaced by actually using it, not a hypothetical one; noting it here rather than the main backlog above since it's pgfault's own gap, not an external project's.
+
+---
+
 <!-- Next entry: append here in the same format once another project is investigated. -->
