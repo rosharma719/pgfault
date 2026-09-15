@@ -24,4 +24,4 @@ webpki-roots.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
-tokio-postgres = "0.7"
+tokio-postgres.workspace = true

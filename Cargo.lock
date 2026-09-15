@@ -660,6 +660,7 @@ dependencies = [
  "pgfault-scenario",
  "pgfault-trace",
  "tokio",
+ "tokio-postgres",
  "tracing",
  "tracing-subscriber",
 ]

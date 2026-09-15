@@ -17,3 +17,4 @@ tracing-subscriber.workspace = true
 pgfault-proxy = { path = "../pgfault-proxy" }
 pgfault-scenario = { path = "../pgfault-scenario" }
 pgfault-trace = { path = "../pgfault-trace" }
+tokio-postgres.workspace = true

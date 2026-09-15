@@ -157,6 +157,21 @@ Every event carries `transaction_epoch`, `query_cycle`, and `statement_index` co
 - `delay` — sleep before forwarding, in either direction.
 - `truncate_result` — cut a result set off after exactly N rows, then reset the connection (only valid on `result.started`).
 
+## Probing external tools
+
+The core loop for finding gaps like the ones in [case studies](#case-studies) is always the same: run some other tool's command through a faulting proxy, then check whether the database's real state matches what that tool reported. `pgfault probe` does both halves in one shot instead of hand-writing a proxy-lifecycle script every time:
+
+```sh
+pgfault probe \
+  --upstream 127.0.0.1:25432 \
+  --scenario dirty-flag-lost-ack.yaml \
+  --verify-sql "SELECT version, dirty FROM schema_migrations" \
+  --verify-dsn "host=127.0.0.1 port=25432 dbname=poc_migrate user=postgres" \
+  -- migrate -path migrations -database "postgres://postgres@127.0.0.1:{{PGFAULT_PORT}}/poc_migrate?sslmode=disable" up
+```
+
+It starts a proxy on an ephemeral port (or `--listen`), substitutes `{{PGFAULT_PORT}}` into the command after `--`, runs it, prints its exit code and output, then — if `--verify-sql`/`--verify-dsn` are given — opens a **separate, direct, non-proxied** connection and runs that query, printing the result right below. The point is the juxtaposition: what the tool said happened, right next to what's actually true in the database, from one command. `pgfault`'s own exit code matches the probed command's, so it composes in scripts and CI.
+
 ## Replay
 
 Every fired fault is recorded with its exact semantic coordinates (not wall-clock time or byte offsets). `pgfault replay <trace.jsonl>` regenerates the scenarios that fired in a trace, so you can re-run the same faults against a different build or a different environment:

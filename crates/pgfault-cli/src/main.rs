@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use pgfault_proxy::{bind, frontend_acceptor, serve, upstream_connector, Config, TlsConfig};
 use pgfault_scenario::Scenario;
@@ -74,6 +74,150 @@ enum Command {
     },
     /// Parse and validate a scenario without opening any sockets.
     Validate { scenario: PathBuf },
+    /// Run an external command against a proxy for one shot, then optionally
+    /// check ground truth with a direct query -- the "does what the client
+    /// saw match what's actually true" loop this tool exists for, automated.
+    Probe {
+        #[arg(long, default_value = "127.0.0.1:0")]
+        listen: String,
+        #[arg(long, default_value = "127.0.0.1:5432")]
+        upstream: String,
+        #[arg(long)]
+        scenario: Vec<PathBuf>,
+        #[arg(long)]
+        trace: Option<PathBuf>,
+        #[command(flatten)]
+        tls: TlsArgs,
+        /// SQL to run directly against the upstream (bypassing the proxy)
+        /// after the command exits, to check what actually happened.
+        #[arg(long, requires = "verify_dsn")]
+        verify_sql: Option<String>,
+        /// Direct, non-proxied connection string for --verify-sql.
+        #[arg(long, requires = "verify_sql")]
+        verify_dsn: Option<String>,
+        /// Command to run. Any argument containing the literal text
+        /// {{PGFAULT_PORT}} has it replaced with the proxy's listen port.
+        /// Put this after `--`.
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+    },
+}
+async fn verify_query(dsn: &str, sql: &str) -> Result<Vec<String>> {
+    let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            tracing::warn!(error=%e, "verify connection ended");
+        }
+    });
+    let messages = client.simple_query(sql).await?;
+    Ok(messages
+        .into_iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(
+                (0..row.len())
+                    .map(|i| row.get(i).unwrap_or("NULL").to_string())
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+            ),
+            _ => None,
+        })
+        .collect())
+}
+struct ProbeArgs {
+    listen: String,
+    upstream: String,
+    scenario: Vec<PathBuf>,
+    trace: Option<PathBuf>,
+    tls: TlsArgs,
+    verify_sql: Option<String>,
+    verify_dsn: Option<String>,
+    command: Vec<String>,
+}
+async fn probe(args: ProbeArgs) -> Result<i32> {
+    let ProbeArgs {
+        listen,
+        upstream,
+        scenario,
+        trace,
+        tls,
+        verify_sql,
+        verify_dsn,
+        command,
+    } = args;
+    let scenarios = scenario
+        .iter()
+        .map(Scenario::load)
+        .collect::<Result<Vec<_>>>()?;
+    let tls = tls.into_config()?;
+    let path = trace.unwrap_or_else(default_trace_path);
+    let recorder = Recorder::create(&path)?;
+    let listener = bind(&listen).await?;
+    let port = listener.local_addr()?.port();
+    tracing::info!(listen=%listener.local_addr()?, %upstream, trace=%path.display(), "pgfault probe listening");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let config = Config {
+        upstream,
+        scenarios,
+        trace: recorder,
+        tls,
+    };
+    let server = tokio::spawn(async move {
+        serve(listener, config, async {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+    let substituted: Vec<String> = command
+        .iter()
+        .map(|a| a.replace("{{PGFAULT_PORT}}", &port.to_string()))
+        .collect();
+    let (program, args) = substituted.split_first().context("empty command")?;
+    let output = tokio::process::Command::new(program)
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("running {program}"))?;
+    let _ = shutdown_tx.send(());
+    server.await??;
+    println!("$ {}", substituted.join(" "));
+    println!(
+        "exit code: {}",
+        output
+            .status
+            .code()
+            .map_or("signaled".to_string(), |c| c.to_string())
+    );
+    if !output.stdout.is_empty() {
+        println!(
+            "--- stdout ---\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+    if !output.stderr.is_empty() {
+        println!(
+            "--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    if let (Some(sql), Some(dsn)) = (verify_sql, verify_dsn) {
+        println!("=== ground truth: {sql} ===");
+        match verify_query(&dsn, &sql).await {
+            Ok(rows) if rows.is_empty() => println!("(no rows)"),
+            Ok(rows) => rows.iter().for_each(|r| println!("{r}")),
+            Err(e) => println!("verify query failed: {e:#}"),
+        }
+    }
+    Ok(output.status.code().unwrap_or(1))
+}
+fn default_trace_path() -> PathBuf {
+    PathBuf::from(format!(
+        ".pgfault/traces/{}-{}.jsonl",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        std::process::id()
+    ))
 }
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -88,6 +232,29 @@ async fn main() -> Result<()> {
             let s = Scenario::load(scenario)?;
             println!("valid: {}", s.name);
             return Ok(());
+        }
+        Command::Probe {
+            listen,
+            upstream,
+            scenario,
+            trace,
+            tls,
+            verify_sql,
+            verify_dsn,
+            command,
+        } => {
+            let code = probe(ProbeArgs {
+                listen,
+                upstream,
+                scenario,
+                trace,
+                tls,
+                verify_sql,
+                verify_dsn,
+                command,
+            })
+            .await?;
+            std::process::exit(code);
         }
         Command::Run {
             listen,
@@ -120,16 +287,7 @@ async fn main() -> Result<()> {
         ),
     };
     let tls = tls.into_config()?;
-    let path = trace.unwrap_or_else(|| {
-        PathBuf::from(format!(
-            ".pgfault/traces/{}-{}.jsonl",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-            std::process::id()
-        ))
-    });
+    let path = trace.unwrap_or_else(default_trace_path);
     let recorder = Recorder::create(&path)?;
     let listener = bind(&listen).await?;
     tracing::info!(listen=%listener.local_addr()?,%upstream,trace=%path.display(),"pgfault listening");
