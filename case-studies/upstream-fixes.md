@@ -200,30 +200,61 @@ Apply with `git apply case-studies/patches/goose-v3.28.0-runsqlmigration-ambiguo
 
 ---
 
-## 4. Flyway — bookkeeping-commit ambiguity confirmed harmless; a real pgfault DSL limitation surfaced while testing the other half
+## 4. Flyway — an ambiguous commit on the *content* connection leaves a migration permanently unrecoverable, with a misleading "rolled back" message masking the real cause
 
-**Status:** no fix needed for what was tested; one half couldn't be tested at all with the current scenario DSL (see limitation below).
+**Status:** issue only, no patch — the fix here isn't a small, targeted change the way #1 and #3 were (see below). This is the most severe of the four findings: not a lockout with a clear diagnostic, but a repeating failure with no hint at the actual cause.
 **Target:** `org.flywaydb:flyway-core` + `flyway-database-postgresql`, verified against `13.6.0`, driven directly via the Java API (no separate CLI distribution needed).
 
 ### Architecture
 
 Flyway is more fragmented than either tool above: it uses **two separate JDBC connections** for one `migrate()` call. Connection A acquires an advisory lock, creates `flyway_schema_history` if needed, and does validation. Connection B — opened, used, and closed independently — executes the migration's actual SQL (`CREATE TABLE` + `INSERT`, committed together in one transaction). Only after connection B has fully closed does connection A insert **one** row into `flyway_schema_history` recording the outcome (`success=true`), in its own separate commit.
 
-Unlike golang-migrate, there's no pre-emptive "mark dirty before doing the work" write — the history row is written once, after the fact, already reflecting the final known outcome. That structural difference matters for what an ambiguous commit can actually do.
+Unlike golang-migrate, there's no pre-emptive "mark dirty before doing the work" write on connection A — its history row is written once, after the fact, already reflecting the known-final outcome. But that only covers connection A's own ambiguity. Testing connection B's required a pgfault DSL improvement made along the way — see below.
 
-### What was tested and found
+### Finding A: connection A's bookkeeping commit — confirmed harmless
 
-Targeting the bookkeeping commit (connection A's `INSERT INTO flyway_schema_history`): it durably succeeds (`success=true` row present), but Flyway reports `FlywaySqlException: Unable to commit transaction` plus a cascade of secondary "connection has been closed" errors (same shape as golang-migrate's "bad connection" cascade — a session-pinned connection dying mid-sequence and breaking the next calls on it), and exits 1.
+Targeting connection A's `INSERT INTO flyway_schema_history`: it durably succeeds (`success=true` row present), but Flyway reports `FlywaySqlException: Unable to commit transaction` plus a cascade of secondary "connection has been closed" errors (same shape as golang-migrate's "bad connection" cascade), and exits 1. **A fresh retry self-heals cleanly**: `Schema "public" is up to date. No migration necessary.`, exit 0. No `repair` step needed — the single already-true history row is exactly what a fresh validation expects to see. Same shape as goose's finding (#3): the reported error is wrong, but nothing is left inconsistent. No fix needed for this half.
 
-**A fresh retry self-heals cleanly**: `Schema "public" is up to date. No migration necessary.`, exit 0, `success=true migrationsExecuted=0`. No `repair` step needed, no lockout — because the single already-true history row is exactly what a fresh validation expects to see. Same shape of outcome as goose's finding (#3): the reported error on the run that actually succeeded is wrong, but nothing is left inconsistent. Not filing a fix for this specific case; it isn't causing operational harm.
+### Finding B: connection B's content commit — the real problem
 
-### What couldn't be tested: a real pgfault limitation
+This required isolating connection B specifically, which pgfault's scenario DSL couldn't do until now — see "Service improvement" below. Once it could: targeting connection B's commit (the `CREATE TABLE poc_accounts; INSERT ...` transaction) with the ambiguous-commit fault produces the same `FlywaySqlException: Unable to commit transaction`, exit 1. Ground truth immediately after:
 
-The genuinely interesting question is the mirror image: what if the ambiguous commit hits connection B (the migration **content** commit) instead — does Flyway correctly detect on retry that the content already applied, or does it try to re-run the same SQL and hit `relation "poc_accounts" already exists`? This is exactly the kind of case worth checking, since Flyway's disambiguation logic covers "is `flyway_schema_history` in a state I understand," not "did the DDL I'm about to (re-)run already happen."
+```
+history_rows | accounts_rows
+0            | 1
+```
 
-It couldn't be isolated with pgfault's current scenario DSL. Scenarios match `occurrence` **per connection** (each connection gets its own independent counter from a fresh `Matcher`), and there's no selector for "the Nth connection this proxy has seen" or anything else that distinguishes connection A from connection B when both share the same `application_name`/`user`/`database` (as they do here — Flyway doesn't let you configure them differently per internal connection). Any `occurrence: N` scenario fires on whichever connection reaches N first, which in this trace is always connection A, since it opens first and does more work before connection B ever connects.
+The migration content **fully and durably applied** — but `flyway_schema_history` has zero rows, because connection A never got a chance to record anything; the whole attempt aborted with a client-visible exception before that step was ever reached. Flyway has **no record this migration ever ran.**
 
-**Candidate fix for pgfault itself:** add a connection-scoping selector to the scenario DSL — e.g. `match.connection_ordinal: 2` (the Nth connection accepted by this proxy instance) — so a scenario can target "whichever connection is the second one opened," independent of any field the target tool sets. This is a real gap in the tool surfaced by actually using it, not a hypothetical one; noting it here rather than the main backlog above since it's pgfault's own gap, not an external project's.
+The natural retry doesn't get a clear diagnostic the way golang-migrate's does. It gets:
+
+```
+FlywayMigrateException: Failed to execute script V1__init.sql
+SQL State: 42P07
+Message: ERROR: relation "poc_accounts" already exists
+...
+SEVERE: Migration of schema "public" to version "1 - init" failed! Changes successfully rolled back.
+```
+
+"Changes successfully rolled back" is true only of *this* attempt's own transaction — it says nothing about the fact that `flyway_schema_history` is still empty and `poc_accounts` still exists from the *first* attempt. Every subsequent `flyway migrate` will fail identically, forever, with no automatic recovery and no message pointing at the actual cause (a phantom table left over from a prior ambiguous run). This is a materially worse operator experience than golang-migrate's `Dirty database version N. Fix and force version.` — that message at least names the problem and the fix; Flyway's says "rolled back," which reads as reassuring rather than as a sign something needs manual attention.
+
+### Why this isn't a small patch
+
+golang-migrate's and goose's fixes worked by re-checking each tool's *own* well-known bookkeeping table after an ambiguous commit — a generic, safe check because the schema being verified is the tool's own. Flyway's content commit runs **arbitrary user SQL**; there's no generic way to verify "did this specific migration's DDL/DML already apply" without parsing and introspecting the target schema per-migration, which is a different and much larger scope of work than a targeted patch. The more tractable fix is architectural: e.g. writing a `pending`/`in-progress` history row *before* running a migration's content (on the same connection, if practical) so a retry has *something* to reconcile against, rather than nothing. That's a real design decision for maintainers, not something to decide unilaterally.
+
+### Suggested issue text (drafted, not sent)
+
+> **Title:** an ambiguous commit while applying a migration's SQL leaves it permanently unrecoverable, with a misleading "rolled back" error masking the cause
+>
+> If the connection that executes a migration's SQL loses its COMMIT acknowledgement (e.g. a connection reset right after PostgreSQL applies it but before the client reads the response), the migration's content is durably applied but `flyway_schema_history` never records it — the failure happens before that bookkeeping step is ever reached. Every subsequent `flyway migrate` then fails with `relation ... already exists` (or the equivalent for whatever the migration created), reported as `Migration ... failed! Changes successfully rolled back.` — which is true of that attempt's own transaction, but gives no indication that the real, permanent problem is a stale object left by a *previous* ambiguous run. There's no automatic recovery and no diagnostic pointing at the actual cause.
+>
+> Reproduction (pgfault, which manufactures this exact ambiguity deterministically) and full details: [link once public].
+>
+> Happy to discuss what the right fix looks like — this doesn't seem like something to patch unilaterally, since it likely needs a bookkeeping strategy change (e.g. a pending/in-progress record before running a migration's content) rather than a local fix.
+
+### Service improvement made along the way: `match.connection_ordinal`
+
+Isolating connection B required a pgfault DSL change: scenarios previously matched `occurrence` per-connection with no way to say "the Nth connection this proxy has seen," so a scenario aimed at "occurrence 1" always fired on whichever connection reached it first — which was always connection A, since it opens first. Added `match.connection_ordinal` (1-based, matching the proxy's own accept-order connection id) directly to pgfault's scenario DSL, with a unit test, and used it here (`connection_ordinal: 2`) to precisely target connection B. This is now a permanent, general capability, not a one-off workaround — already merged into `main`, not just logged as a future patch.
 
 ---
 

@@ -15,8 +15,7 @@ pgfault reproduces it on demand, byte-for-byte, every time. The `ambiguous-commi
 Real gaps found in real, widely-used open-source projects by pointing pgfault at them:
 
 - [**golang-migrate**](case-studies/golang-migrate-ambiguous-commit/) — an ambiguous commit during golang-migrate's own internal version-bookkeeping (not the migration itself) permanently locks it out of the database with `Dirty database version N. Fix and force version.`, requiring manual intervention, even though zero migration content was ever at risk. Fully reproducible with one script against a real PostgreSQL server.
-
-Root-cause fixes for these, verified locally but not yet submitted upstream, are tracked in [`case-studies/upstream-fixes.md`](case-studies/upstream-fixes.md).
+- **goose** and **Flyway** — two more migration tools checked the same way, with genuinely different outcomes: goose's atomic single-transaction design avoids a lockout entirely (self-heals on retry) but still misreports success as failure; Flyway's split-connection design means an ambiguous commit on the connection running a migration's actual SQL leaves it **permanently unrecoverable** with a misleading "rolled back" message that hides the real cause — the most severe of the findings so far. Details for all of these, plus root-cause fixes where one is tractable, are tracked in [`case-studies/upstream-fixes.md`](case-studies/upstream-fixes.md).
 
 ## Testing PostgreSQL extensions
 
@@ -100,6 +99,9 @@ match:                     # optional; omitted fields match anything
   application_name: checkout-test
   user: postgres
   database: postgres
+  connection_ordinal: 2    # the Nth connection this proxy has accepted, 1-based --
+                           # useful when one client tool opens several connections
+                           # that don't otherwise differ (see case-studies/upstream-fixes.md #4)
   transaction: 1           # transaction_epoch, 1-based
   query_cycle: 1            # 1-based
   statement: 1              # 1-based

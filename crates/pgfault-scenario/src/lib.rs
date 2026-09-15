@@ -18,6 +18,10 @@ pub struct Selector {
     pub application_name: Option<String>,
     pub user: Option<String>,
     pub database: Option<String>,
+    /// The Nth connection accepted by this proxy process (1-based), for
+    /// telling apart multiple connections opened by one client tool that
+    /// don't otherwise differ in application_name/user/database.
+    pub connection_ordinal: Option<u64>,
     pub transaction: Option<u64>,
     pub query_cycle: Option<u64>,
     pub statement: Option<u64>,
@@ -102,6 +106,9 @@ impl Scenario {
         if self.when.occurrence == Some(0) || self.when.row == Some(0) {
             bail!("occurrence and row are one-based");
         }
+        if self.selector.connection_ordinal == Some(0) {
+            bail!("connection_ordinal is one-based");
+        }
         if let Some(d) = &self.action.delay {
             let duration =
                 humantime::parse_duration(&d.duration).context("invalid delay duration")?;
@@ -146,6 +153,7 @@ impl Scenario {
             && m.database
                 .as_ref()
                 .is_none_or(|s| e.startup.database.as_ref() == Some(s))
+            && m.connection_ordinal.is_none_or(|n| e.connection_id == n)
             && m.transaction.is_none_or(|n| e.transaction_epoch == n)
             && m.query_cycle.is_none_or(|n| e.query_cycle == n)
             && m.statement.is_none_or(|n| e.statement_index == n)
@@ -194,10 +202,38 @@ impl Matcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pgfault_events::StartupMetadata;
     #[test]
     fn strict_validation() {
         assert!(serde_yaml::from_str::<Scenario>("version: 1\nname: x\nwhen: { event: result.row, typo: 3 }\naction: {suppress: {current: true}}\n").is_err());
         let s:Scenario=serde_yaml::from_str("version: 1\nname: x\nwhen: {event: result.row, occurrence: 0}\naction: {suppress: {current: true}}\n").unwrap();
         assert!(s.validate().is_err());
+        let s: Scenario = serde_yaml::from_str("version: 1\nname: x\nmatch: {connection_ordinal: 0}\nwhen: {event: result.row}\naction: {suppress: {current: true}}\n").unwrap();
+        assert!(s.validate().is_err());
+    }
+    fn event(connection_id: u64) -> Event {
+        Event {
+            connection_id,
+            semantic_reliable: true,
+            startup: StartupMetadata::default(),
+            transaction_epoch: 1,
+            query_cycle: 1,
+            statement_index: 1,
+            statement_class: StatementClass::Other,
+            sql_fingerprint: String::new(),
+            event: "result.row".into(),
+            occurrence: 1,
+            row_index: None,
+        }
+    }
+    #[test]
+    fn connection_ordinal_distinguishes_same_named_connections() {
+        let s: Scenario = serde_yaml::from_str(
+            "version: 1\nname: x\nmatch: {connection_ordinal: 2}\nwhen: {event: result.row}\naction: {suppress: {current: true}}\n",
+        )
+        .unwrap();
+        assert!(!s.selects(&event(1)));
+        assert!(s.selects(&event(2)));
+        assert!(!s.selects(&event(3)));
     }
 }
