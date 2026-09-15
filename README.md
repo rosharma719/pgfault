@@ -16,6 +16,8 @@ Real gaps found in real, widely-used open-source projects by pointing pgfault at
 
 - [**golang-migrate**](case-studies/golang-migrate-ambiguous-commit/) — an ambiguous commit during golang-migrate's own internal version-bookkeeping (not the migration itself) permanently locks it out of the database with `Dirty database version N. Fix and force version.`, requiring manual intervention, even though zero migration content was ever at risk. Fully reproducible with one script against a real PostgreSQL server.
 
+Root-cause fixes for these, verified locally but not yet submitted upstream, are tracked in [`case-studies/upstream-fixes.md`](case-studies/upstream-fixes.md).
+
 ## Testing PostgreSQL extensions
 
 pgfault doesn't care which side of a connection is "the app." Anything that speaks the PostgreSQL wire protocol can be pointed at it — including PostgreSQL itself. A lot of the most interesting extension bugs live exactly in the connections **PostgreSQL opens as a client**:

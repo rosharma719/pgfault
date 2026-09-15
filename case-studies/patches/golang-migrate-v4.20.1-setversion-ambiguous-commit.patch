@@ -1,0 +1,50 @@
+diff --git a/database/postgres/postgres.go b/database/postgres/postgres.go
+index ed96fe6..0a32fe4 100644
+--- a/database/postgres/postgres.go
++++ b/database/postgres/postgres.go
+@@ -380,6 +380,24 @@ func (p *Postgres) SetVersion(version int, dirty bool) error {
+ 	}
+ 
+ 	if err := tx.Commit(); err != nil {
++		// The client can lose the COMMIT acknowledgement even though
++		// PostgreSQL durably applied it -- e.g. the connection resets right
++		// after the server's response is sent but before it's read. p.conn
++		// is frequently unusable after this (observed as a "bad connection"
++		// on the very next call on it), so this check goes through p.db, a
++		// separate connection from the pool, rather than p.conn. If the
++		// version table already reflects exactly what this call intended to
++		// write, the commit succeeded; report success instead of an
++		// ambiguous failure that would otherwise leave the caller thinking
++		// no work happened at all. If it doesn't match -- including if this
++		// verification itself fails, e.g. because the database is genuinely
++		// unreachable -- fall through to reporting the original error, which
++		// preserves today's behavior.
++		if p.db != nil {
++			if v, d, verifyErr := p.versionVia(p.db); verifyErr == nil && v == version && d == dirty {
++				return nil
++			}
++		}
+ 		return &database.Error{OrigErr: err, Err: "transaction commit failed"}
+ 	}
+ 
+@@ -387,8 +405,19 @@ func (p *Postgres) SetVersion(version int, dirty bool) error {
+ }
+ 
+ func (p *Postgres) Version() (version int, dirty bool, err error) {
++	return p.versionVia(p.conn)
++}
++
++// queryRower is satisfied by both *sql.Conn and *sql.DB, so SetVersion's
++// post-commit check can go through a fresh connection from the pool (p.db)
++// instead of the possibly now-broken pinned one (p.conn).
++type queryRower interface {
++	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
++}
++
++func (p *Postgres) versionVia(q queryRower) (version int, dirty bool, err error) {
+ 	query := `SELECT version, dirty FROM ` + pq.QuoteIdentifier(p.config.migrationsSchemaName) + `.` + pq.QuoteIdentifier(p.config.migrationsTableName) + ` LIMIT 1`
+-	err = p.conn.QueryRowContext(context.Background(), query).Scan(&version, &dirty)
++	err = q.QueryRowContext(context.Background(), query).Scan(&version, &dirty)
+ 	switch {
+ 	case err == sql.ErrNoRows:
+ 		return database.NilVersion, false, nil

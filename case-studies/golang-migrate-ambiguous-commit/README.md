@@ -4,6 +4,8 @@
 
 **Run it yourself:** `python3 reproduce.py` (needs `go` and a PostgreSQL server on `127.0.0.1:25432`; see the repo root README for setup). Everything below is that script's actual output.
 
+**A root-cause fix exists but isn't submitted yet** — see [`../upstream-fixes.md`](../upstream-fixes.md) for the patch, verification, and drafted issue/PR text, including an important nuance the fix alone doesn't resolve.
+
 ## Background: how golang-migrate tracks state
 
 Reading `database/postgres/postgres.go` in the driver: applying migration version N is two separate steps, not one transaction.
