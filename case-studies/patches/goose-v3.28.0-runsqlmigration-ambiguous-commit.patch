@@ -1,0 +1,25 @@
+diff --git a/migration_sql.go b/migration_sql.go
+index 1fcb06d..85fd1ab 100644
+--- a/migration_sql.go
++++ b/migration_sql.go
+@@ -61,6 +61,20 @@ func runSQLMigration(
+ 
+ 		verboseInfo("Commit transaction")
+ 		if err := tx.Commit(); err != nil {
++			// The client can lose the COMMIT acknowledgement even though the
++			// database durably applied it -- e.g. the connection resets
++			// right after the server's response is sent but before it's
++			// read. Since the migration content and the version bookkeeping
++			// above are committed together in this one transaction, either
++			// both landed or neither did; check via a fresh connection from
++			// the pool (not the one that may have just broken) whether the
++			// version row this call intended to write is already there
++			// before concluding this failed.
++			if !noVersioning {
++				if result, verifyErr := store.GetMigration(ctx, db, TableName(), v); verifyErr == nil && result.IsApplied == direction {
++					return nil
++				}
++			}
+ 			return fmt.Errorf("failed to commit transaction: %w", err)
+ 		}
+ 

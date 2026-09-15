@@ -121,4 +121,83 @@ Recovering from a broken `p.conn` mid-run means: detecting the bad-connection er
 
 ---
 
+## 3. pressly/goose — `runSQLMigration` misreports an ambiguous commit as failure (lower severity than #1: no lockout, self-heals on retry, but the reported error is still wrong)
+
+**Status:** not submitted. Fix implemented and verified locally; PR not opened.
+**Target:** `github.com/pressly/goose/v3`, verified against tag `v3.28.0`
+**Patch:** [`patches/goose-v3.28.0-runsqlmigration-ambiguous-commit.patch`](patches/goose-v3.28.0-runsqlmigration-ambiguous-commit.patch)
+
+### Why this was worth checking after #1
+
+goose is architecturally different from golang-migrate in exactly the relevant way: a migration's SQL and its version-bookkeeping row are committed **together, in one transaction** (`migration_sql.go`'s `runSQLMigration`), not as two separate transactions. That's a real design advantage — it means an ambiguous commit can never leave the migration applied but unrecorded (or vice versa); it's genuinely all-or-nothing. Worth confirming empirically rather than assuming, since "architecture that should be immune" and "architecture that is immune" aren't automatically the same thing.
+
+### What was found
+
+Aiming pgfault's ambiguous-commit fault at that single combined commit: the commit durably succeeds (both `poc_accounts` and the `goose_db_version` row land correctly), but `goose up` reports:
+
+```
+goose run: ERROR 00001_init.sql: failed to run SQL migration: failed to commit transaction: conn closed
+```
+
+and exits 1 — a **false failure report**, same class of bug as golang-migrate's, but critically **not the same severity**: retrying with a fresh invocation shows
+
+```
+goose: no migrations to run. current version: 1
+```
+
+exit 0. No dirty flag, no `force`/`repair` step, no manual intervention — goose has no persistent "this attempt might have failed" marker at all, so a fresh process just re-derives the truth from the table and proceeds correctly. The atomic single-transaction design does exactly what it should: it fully avoids the operational damage (the lockout) that golang-migrate's two-transaction design causes. What's left is strictly a **misleading error message on a run that actually fully succeeded** — a correctness/UX bug in the tool's reporting, not a data-safety or availability bug.
+
+### The fix
+
+Same pattern as #1, adapted to goose's API: on a commit error, check via a **fresh connection from the pool** (`db`, the `*sql.DB` already passed into `runSQLMigration` — not the transaction that just failed) whether the version table already shows this call's intended `(version, is_applied)`. Since content and bookkeeping commit atomically together here, that check alone is sufficient proof the whole migration applied (unlike golang-migrate, no separate check of the migration content itself is needed).
+
+```diff
+--- a/migration_sql.go
++++ b/migration_sql.go
+@@ -61,6 +61,20 @@ func runSQLMigration(
+ 
+ 		verboseInfo("Commit transaction")
+ 		if err := tx.Commit(); err != nil {
++			// The client can lose the COMMIT acknowledgement even though the
++			// database durably applied it -- e.g. the connection resets
++			// right after the server's response is sent but before it's
++			// read. Since the migration content and the version bookkeeping
++			// above are committed together in this one transaction, either
++			// both landed or neither did; check via a fresh connection from
++			// the pool (not the one that may have just broken) whether the
++			// version row this call intended to write is already there
++			// before concluding this failed.
++			if !noVersioning {
++				if result, verifyErr := store.GetMigration(ctx, db, TableName(), v); verifyErr == nil && result.IsApplied == direction {
++					return nil
++				}
++			}
+ 			return fmt.Errorf("failed to commit transaction: %w", err)
+ 		}
+```
+
+Apply with `git apply case-studies/patches/goose-v3.28.0-runsqlmigration-ambiguous-commit.patch` from a `pressly/goose` checkout at `v3.28.0`.
+
+### What was actually verified
+
+- `go build ./...` and `go vet ./...` clean on the patched tree.
+- Patch applies cleanly to a fresh `v3.28.0` checkout (`git apply --check`).
+- Rebuilt `cmd/goose` from the patched branch and reran the identical fault: before the patch, exit 1 with the misleading commit-failure error; after, `goose: successfully migrated database to version: 1`, exit 0 — on the **same single invocation** that used to fail, not just on a subsequent retry.
+- Final database state (`goose_db_version`, `poc_accounts`) identical to the no-fault baseline in both cases — the fix changes only what's reported, never what's written.
+- Unlike finding #1, no secondary connection-pinning issue surfaced here: goose also uses a session-pinned connection for its advisory lock (same pattern, same theoretical fragility), but because this bug's fault fires on the *last* operation of the run rather than the *first*, there's no subsequent call in the same invocation left to fail on the broken connection. This fix is complete for the scenario tested, without the caveat #1 needed.
+
+### Suggested PR description (drafted, not sent)
+
+> **Title:** don't report a lost commit ack as a migration failure
+>
+> `runSQLMigration` commits a migration's SQL and its version-bookkeeping row together in one transaction, which is exactly right — it means the two can never land inconsistently. But if `tx.Commit()` returns an error, that's currently reported as an unconditional failure, even though PostgreSQL (or any backend) may have durably applied it — the client just never saw the acknowledgement (e.g. a connection reset right after the server responds but before the client reads it).
+>
+> Concretely: `goose up` can print `ERROR ...: failed to commit transaction: conn closed` and exit 1 for a migration that fully and correctly applied. Retrying self-heals cleanly (goose has no dirty-flag-style lockout, unlike some other migration tools — verified this doesn't cascade into anything worse), but the reported result on the run that actually succeeded is simply wrong, which is confusing in exactly the moment (a flaky deploy) where a clear signal matters most.
+>
+> This checks the version table through a fresh pooled connection after a commit error, and only treats it as success if the table already shows exactly what this call intended to write (matching `direction`). Genuine failures, including if this verification query itself can't run, are reported exactly as before.
+>
+> Reproduction and the comparison against a tool where this same fault class *does* cause a real lockout: [link to pgfault case study/backlog once public].
+
+---
+
 <!-- Next entry: append here in the same format once another project is investigated. -->
