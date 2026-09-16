@@ -258,4 +258,25 @@ Isolating connection B required a pgfault DSL change: scenarios previously match
 
 ---
 
+## 5. Alembic — confirmed robust; the simplest architecture of the four tools tested
+
+**Status:** no fix needed. Included for completeness of the comparison, not because a gap was found.
+**Target:** `alembic` (Python, the standard SQLAlchemy migration tool), verified against `1.20.0` with SQLAlchemy `2.0.54` and `psycopg2`.
+
+### Architecture
+
+Alembic is the simplest of the four by a wide margin. Reading `MigrationContext.run_migrations` in `alembic/runtime/migration.py`: for each migration step, `step.migration_fn(**kw)` (the user's `upgrade()`, i.e. the actual migration content) and `head_maintainer.update_to_step(step)` (updating the single `alembic_version.version_num` column) run inside the *same* `begin_transaction(_per_migration=True)` block. Confirmed empirically too: a full `alembic upgrade head` run against a fresh database produced exactly **one connection, one commit, total** — no separate lock-acquisition transaction, no separate history-table bootstrap transaction, nothing split across connections. Version tracking here isn't even an append-only log (like goose) or a dirty-flagged row (like golang-migrate) — it's a single mutable column holding the current revision, full stop.
+
+### What was tested and found
+
+Targeting that one commit with the ambiguous-commit fault: `alembic upgrade head` reports `sqlalchemy.exc.OperationalError: server closed the connection unexpectedly` and exits 1. Ground truth immediately after: `version_num='0001'`, `poc_accounts` has its row — fully and correctly applied, exactly as the atomic single-transaction, single-connection design would predict.
+
+**A fresh retry is completely silent and clean**: exit 0, no output at all, because Alembic is already at the head revision and there's nothing to do. No misleading message even needs interpreting (unlike goose's "no change" or Flyway's "up to date" — there's simply nothing printed), no lockout, no manual step. This is the cleanest self-heal of the four tools tested. No fix warranted.
+
+### Where this leaves the comparison across all five entries
+
+The pattern holds across every tool tested so far: **the moment content and bookkeeping commit in the same transaction, on the same connection, an ambiguous commit is a non-event.** golang-migrate is the only tool that separates them into two transactions on the same connection (real lockout). Flyway separates them further, onto two different connections entirely (the most severe outcome — permanent, misdiagnosed failure). goose and Alembic keep everything atomic and both come through clean. Architecture, not language or ecosystem, is what predicts the outcome.
+
+---
+
 <!-- Next entry: append here in the same format once another project is investigated. -->
