@@ -48,3 +48,190 @@ index ed96fe6..0a32fe4 100644
  	switch {
  	case err == sql.ErrNoRows:
  		return database.NilVersion, false, nil
+diff --git a/database/postgres/postgres_ambiguous_commit_test.go b/database/postgres/postgres_ambiguous_commit_test.go
+new file mode 100644
+index 0000000..2537dd9
+--- /dev/null
++++ b/database/postgres/postgres_ambiguous_commit_test.go
+@@ -0,0 +1,181 @@
++package postgres
++
++// Regression tests for SetVersion's handling of an ambiguous commit: the
++// case where PostgreSQL durably applies a COMMIT but the client never sees
++// the acknowledgement (e.g. the connection resets right after the server's
++// response is sent but before it's read). These use a fake database/sql
++// driver rather than a real PostgreSQL instance, so they run without Docker
++// and exercise exactly the control-flow branch the fix touches.
++
++import (
++	"context"
++	"database/sql"
++	"database/sql/driver"
++	"errors"
++	"io"
++	"strings"
++	"sync"
++	"testing"
++)
++
++// fakeState is the shared, durable row behind schema_migrations, visible to
++// every connection fakeDriver hands out -- standing in for the real
++// database, so a query on a *different* connection than the one that ran
++// the ambiguous commit still sees its effect if it truly landed.
++type fakeState struct {
++	mu      sync.Mutex
++	version int64
++	dirty   bool
++	hasRow  bool
++}
++
++// fakeDriver simulates one specific failure shape: every transaction's
++// Commit() reports commitErr, and applyOnExec controls whether the writes
++// inside that transaction actually land in fakeState regardless (an
++// ambiguous commit that truly succeeded) or never land at all (a genuine
++// failure) -- exactly the distinction SetVersion now has to make.
++type fakeDriver struct {
++	state       *fakeState
++	commitErr   error
++	applyOnExec bool
++}
++
++func (d *fakeDriver) Open(name string) (driver.Conn, error) {
++	return &fakeConn{driver: d}, nil
++}
++
++type fakeConn struct{ driver *fakeDriver }
++
++func (c *fakeConn) Prepare(query string) (driver.Stmt, error) {
++	return nil, errors.New("fakeConn: Prepare not implemented")
++}
++func (c *fakeConn) Close() error { return nil }
++func (c *fakeConn) Begin() (driver.Tx, error) {
++	return &fakeTx{conn: c}, nil
++}
++func (c *fakeConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
++	return &fakeTx{conn: c}, nil
++}
++func (c *fakeConn) Ping(ctx context.Context) error { return nil }
++
++func (c *fakeConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
++	switch {
++	case strings.Contains(query, "TRUNCATE"):
++		if c.driver.applyOnExec {
++			c.driver.state.mu.Lock()
++			c.driver.state.hasRow = false
++			c.driver.state.mu.Unlock()
++		}
++	case strings.Contains(query, "INSERT"):
++		if c.driver.applyOnExec && len(args) == 2 {
++			version, _ := args[0].Value.(int64)
++			dirty, _ := args[1].Value.(bool)
++			c.driver.state.mu.Lock()
++			c.driver.state.version = version
++			c.driver.state.dirty = dirty
++			c.driver.state.hasRow = true
++			c.driver.state.mu.Unlock()
++		}
++	}
++	return driver.ResultNoRows, nil
++}
++
++func (c *fakeConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
++	c.driver.state.mu.Lock()
++	defer c.driver.state.mu.Unlock()
++	if !c.driver.state.hasRow {
++		return &fakeRows{}, nil
++	}
++	return &fakeRows{version: c.driver.state.version, dirty: c.driver.state.dirty, hasRow: true}, nil
++}
++
++type fakeTx struct{ conn *fakeConn }
++
++func (t *fakeTx) Commit() error   { return t.conn.driver.commitErr }
++func (t *fakeTx) Rollback() error { return nil }
++
++type fakeRows struct {
++	version int64
++	dirty   bool
++	hasRow  bool
++	served  bool
++}
++
++func (r *fakeRows) Columns() []string { return []string{"version", "dirty"} }
++func (r *fakeRows) Close() error      { return nil }
++func (r *fakeRows) Next(dest []driver.Value) error {
++	if !r.hasRow || r.served {
++		return io.EOF
++	}
++	r.served = true
++	dest[0] = r.version
++	dest[1] = r.dirty
++	return nil
++}
++
++func newFakePostgres(t *testing.T, name string, drv *fakeDriver) *Postgres {
++	t.Helper()
++	sql.Register(name, drv)
++	db, err := sql.Open(name, "")
++	if err != nil {
++		t.Fatalf("sql.Open: %v", err)
++	}
++	t.Cleanup(func() { _ = db.Close() })
++	conn, err := db.Conn(context.Background())
++	if err != nil {
++		t.Fatalf("db.Conn: %v", err)
++	}
++	t.Cleanup(func() { _ = conn.Close() })
++	return &Postgres{
++		conn: conn,
++		db:   db,
++		config: &Config{
++			migrationsSchemaName: "public",
++			migrationsTableName:  "schema_migrations",
++		},
++	}
++}
++
++// This is the bug this patch fixes: the commit genuinely landed (fakeState
++// reflects the intended write), but the caller's Commit() call itself
++// returned an error, as happens when the acknowledgement is lost. Before
++// the fix, SetVersion always reported this as a failure.
++func TestSetVersion_RecoversFromAmbiguousCommit(t *testing.T) {
++	p := newFakePostgres(t, "fake_ambiguous_ok", &fakeDriver{
++		state:       &fakeState{},
++		commitErr:   errors.New("read tcp: connection reset by peer"),
++		applyOnExec: true,
++	})
++	if err := p.SetVersion(1, true); err != nil {
++		t.Fatalf("SetVersion should have recognized the ambiguous commit succeeded, got error: %v", err)
++	}
++}
++
++// A commit that genuinely never landed (fakeState never reflects the
++// intended write) must still be reported as a failure -- the fix must not
++// paper over real errors.
++func TestSetVersion_StillFailsOnGenuineCommitFailure(t *testing.T) {
++	p := newFakePostgres(t, "fake_ambiguous_fail", &fakeDriver{
++		state:       &fakeState{},
++		commitErr:   errors.New("connection refused"),
++		applyOnExec: false,
++	})
++	if err := p.SetVersion(1, true); err == nil {
++		t.Fatal("SetVersion should still report failure when the write never actually landed")
++	}
++}
++
++// If the verification query itself can't run (here: the whole pool is
++// unreachable), the original commit error must still surface rather than
++// being silently swallowed.
++func TestSetVersion_FailsIfVerificationItselfFails(t *testing.T) {
++	p := newFakePostgres(t, "fake_ambiguous_verify_fails", &fakeDriver{
++		state:       &fakeState{},
++		commitErr:   errors.New("connection reset"),
++		applyOnExec: true,
++	})
++	_ = p.db.Close() // the pool is now unusable, so the verification query must fail
++	if err := p.SetVersion(1, true); err == nil {
++		t.Fatal("SetVersion should report failure when it cannot verify the commit's outcome")
++	}
++}

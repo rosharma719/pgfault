@@ -8,10 +8,10 @@ Nothing here has been forked, pushed, or opened on GitHub yet. Forking/opening a
 
 ## 1. golang-migrate/migrate — `SetVersion` misreports an ambiguous commit as failure
 
-**Status:** not submitted. Fix implemented and verified locally; PR not opened.
+**Status:** PR-ready. Fix implemented, covered by a red/green-verified regression test, applies cleanly to a fresh checkout, builds and vets clean. Not opened as a PR yet.
 **Full case study:** [`golang-migrate-ambiguous-commit/`](golang-migrate-ambiguous-commit/) (reproduction script, scenarios, narrative writeup)
 **Target:** `github.com/golang-migrate/migrate`, verified against tag `v4.20.1`
-**Patch:** [`patches/golang-migrate-v4.20.1-setversion-ambiguous-commit.patch`](patches/golang-migrate-v4.20.1-setversion-ambiguous-commit.patch)
+**Patch:** [`patches/golang-migrate-v4.20.1-setversion-ambiguous-commit.patch`](patches/golang-migrate-v4.20.1-setversion-ambiguous-commit.patch) — now includes `database/postgres/postgres_ambiguous_commit_test.go`, a self-contained regression test (fake `database/sql/driver`, no Docker/real Postgres needed)
 
 ### The bug
 
@@ -74,10 +74,20 @@ Nothing here has been forked, pushed, or opened on GitHub yet. Forking/opening a
 
 Apply with `git apply case-studies/patches/golang-migrate-v4.20.1-setversion-ambiguous-commit.patch` from a `golang-migrate/migrate` checkout at `v4.20.1`.
 
+### The regression test (included in the patch)
+
+`postgres_ambiguous_commit_test.go` adds a minimal fake `database/sql/driver` — no Docker, no real PostgreSQL — that can simulate two distinct failure shapes on `Commit()`: an ambiguous one where the write actually lands in a shared, connection-independent state (standing in for the real database) despite `Commit()` reporting an error, and a genuine one where it doesn't. Three tests:
+
+- `TestSetVersion_RecoversFromAmbiguousCommit` — the actual bug. Commit errors, but the write landed; `SetVersion` must return `nil`.
+- `TestSetVersion_StillFailsOnGenuineCommitFailure` — commit errors and the write never landed; `SetVersion` must still report failure. Guards against the fix papering over real errors.
+- `TestSetVersion_FailsIfVerificationItselfFails` — the verification query itself can't run (pool closed); the original commit error must still surface, not be swallowed.
+
 ### What was actually verified
 
-- `go build ./...`, `go vet ./database/postgres/...` — clean on the patched tree.
-- Rebuilt `cmd/migrate` from the patched branch and reran it against pgfault's `dirty-flag-lost-ack.yaml` scenario (same one used in the case study): `SetVersion(1, true)`'s ambiguous commit is now correctly recognized as successful instead of being reported as a transaction-commit failure.
+- **Red/green, not just green:** ran `TestSetVersion_RecoversFromAmbiguousCommit` against the unpatched `v4.20.1` tree first — confirmed it fails there (`SetVersion should have recognized the ambiguous commit succeeded, got error: transaction commit failed...`), proving it's a real regression test and not a tautology. Applied the patch, reran — all three tests pass.
+- Repeated that whole cycle against a **second, independent fresh clone** of `v4.20.1` (not the working tree used for development) to rule out any local-state artifact: `git apply --check` succeeds, `go build ./...` and `go vet ./database/postgres/...` are clean, and both the new tests and the package's other existing non-Docker test (`Test_computeLineFromPos`) pass.
+- Also rebuilt `cmd/migrate` from the patched branch and reran it against pgfault's `dirty-flag-lost-ack.yaml` scenario (same one used in the case study): `SetVersion(1, true)`'s ambiguous commit is correctly recognized as successful instead of reported as a transaction-commit failure — confirming the fix works against real PostgreSQL, not just the fake driver.
+- **Not run:** the package's existing `dktest`/Docker-based integration suite (real Postgres containers across versions 14/15/16) — the local Docker daemon wasn't responding when this was attempted. Everything achievable without it has been done; whoever opens the PR should run `go test ./...` with Docker available before submitting, as a final check that nothing in the broader suite regressed.
 - **Important, deliberately-not-oversold finding:** this fix alone does **not** eliminate the `Dirty database` lockout in the exact case-study scenario. pgfault's fault fully resets the TCP connection, not just drops one ack, and golang-migrate pins a single physical connection (`p.conn`) for the whole `migrate up` invocation — needed because Postgres advisory locks are session-scoped. Once that connection is dead, the very next call in the same process (`Run()`, executing the migration body) fails with `driver: bad connection`, so `dirty=true` still ends up persisted and a same-process retry still can't proceed. The fix is correct and worth shipping — it resolves the case where an ack is lost but the connection itself survives (e.g. a lossy proxy/load balancer, not a full reset), and it makes `SetVersion`'s own semantics correct regardless. It just isn't sufficient on its own to fix the full lockout observed when the connection is fully severed. See finding #2.
 
 ### Suggested PR description (drafted, not sent)
@@ -87,6 +97,8 @@ Apply with `git apply case-studies/patches/golang-migrate-v4.20.1-setversion-amb
 > `SetVersion`'s `tx.Commit()` can return an error even when PostgreSQL durably applied the commit — the client just never saw the acknowledgement (e.g. the connection resets right after the server responds but before the client reads it). Concretely, this means `SetVersion(N, dirty=true)` — called before a migration's SQL even runs — can leave the database in exactly the intended state while `migrate` reports a hard failure, and every subsequent `migrate up` then refuses to proceed with `Dirty database version N. Fix and force version.`, requiring manual `migrate force` even though nothing is actually wrong.
 >
 > This checks the version table through a fresh pooled connection (not the one that may have just broken) after a commit error, and only treats it as success if the table already shows exactly what this call intended to write. Genuine failures — including if the verification query itself can't run — are reported exactly as before.
+>
+> Includes a regression test (`postgres_ambiguous_commit_test.go`) using a fake `database/sql/driver` to simulate the ambiguous-commit case without needing Docker or real Postgres, plus tests confirming genuine failures and verification failures still report correctly.
 >
 > Reproduction and the full writeup: [link to the pgfault case study once public].
 >
