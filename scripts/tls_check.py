@@ -11,6 +11,7 @@ backend the proxy opened -- not on some separate side-channel connection.
 """
 import contextlib
 import os
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -55,12 +56,55 @@ def proxy(extra_args, log_path):
             p.wait(timeout=5)
 
 
-with tempfile.TemporaryDirectory() as d:
-    d = Path(d)
-    cert, key = d / 'server.crt', d / 'server.key'
+def find_upstream_container():
+    """The container ID of a postgres:* image publishing UPSTREAM's port, or
+    None if the upstream isn't containerized (e.g. it's running natively on
+    this machine). Used so the upstream-TLS cert can be generated *inside*
+    that container's own filesystem, sidestepping any question of whether a
+    bind mount or a copy would actually be visible to it -- generating and
+    consuming it on the same side of the boundary avoids the question
+    entirely.
+    """
+    upstream_port = UPSTREAM.rsplit(':', 1)[-1]
+    try:
+        result = subprocess.run(
+            ['docker', 'ps', '--filter', f'publish={upstream_port}', '--format', '{{.ID}}\t{{.Image}}'],
+            capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    for line in result.stdout.strip().splitlines():
+        cid, _, image = line.partition('\t')
+        if image.startswith('postgres'):
+            return cid
+    return None
+
+
+def make_cert_locally(dir_, name):
+    cert, key = dir_ / f'{name}.crt', dir_ / f'{name}.key'
     subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-keyout', str(key),
                      '-out', str(cert), '-days', '2', '-nodes', '-subj', '/CN=localhost'],
-                    check=True, capture_output=True)
+                    check=True)
+    return cert, key
+
+
+def make_cert_in_container(container):
+    """Generate a cert inside the container using its own openssl, then
+    chown it to the postgres user by name (resolved inside the container,
+    so no need to know or guess its numeric uid)."""
+    remote_dir = '/tmp/pgfault-tls-check'
+    subprocess.run(['docker', 'exec', container, 'mkdir', '-p', remote_dir], check=True)
+    cert, key = f'{remote_dir}/server.crt', f'{remote_dir}/server.key'
+    subprocess.run(['docker', 'exec', container, 'openssl', 'req', '-x509', '-newkey', 'rsa:2048',
+                     '-keyout', key, '-out', cert, '-days', '2', '-nodes', '-subj', '/CN=localhost'],
+                    check=True)
+    subprocess.run(['docker', 'exec', container, 'chown', 'postgres:postgres', cert, key], check=True)
+    subprocess.run(['docker', 'exec', container, 'chmod', '600', key], check=True)
+    return cert, key
+
+
+with tempfile.TemporaryDirectory() as d:
+    d = Path(d)
+    cert, key = make_cert_locally(d, 'frontend')
 
     # --- frontend termination: client requires TLS, upstream stays plain ---
     # sslmode=require makes libpq refuse the connection outright unless a real
@@ -70,13 +114,30 @@ with tempfile.TemporaryDirectory() as d:
             assert c.execute('select 1').fetchone() == (1,)
 
     # --- upstream origination: enable TLS on the real Postgres, plain client to pgfault ---
+    # If the upstream is a separate container (e.g. a CI services: postgres),
+    # generate its cert inside that container directly rather than trying to
+    # share a directory across the container boundary.
+    container = find_upstream_container()
+    if container:
+        upstream_cert_path, upstream_key_path = make_cert_in_container(container)
+    else:
+        upstream_cert, upstream_key = make_cert_locally(d, 'upstream')
+        upstream_cert_path, upstream_key_path = str(upstream_cert), str(upstream_key)
+
     with psycopg.connect(DIRECT, autocommit=True) as admin:
         admin.execute("alter system set ssl = on")
-        admin.execute(f"alter system set ssl_cert_file = '{cert}'")
-        admin.execute(f"alter system set ssl_key_file = '{key}'")
-        os.chmod(key, 0o600)
+        admin.execute(f"alter system set ssl_cert_file = '{upstream_cert_path}'")
+        admin.execute(f"alter system set ssl_key_file = '{upstream_key_path}'")
         admin.execute("select pg_reload_conf()")
-        assert admin.execute("show ssl").fetchone() == ('on',), 'upstream did not accept ssl=on'
+
+    # pg_reload_conf() signals the postmaster, which reloads and relays
+    # SIGHUP to each backend independently; the calling connection's own
+    # backend isn't guaranteed to have caught up to its own request yet. A
+    # fresh connection reads the current config at startup, so it sees the
+    # change deterministically instead of racing the old backend's signal
+    # handling.
+    with psycopg.connect(DIRECT, autocommit=True) as check:
+        assert check.execute("show ssl").fetchone() == ('on',), 'upstream did not accept ssl=on'
 
     with proxy(['--upstream-tls', '--upstream-tls-insecure'], d / 'upstream.log') as port:
         with psycopg.connect(f'host=127.0.0.1 port={port} dbname=postgres user=postgres sslmode=disable') as c:
