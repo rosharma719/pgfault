@@ -101,7 +101,7 @@ mod tests {
     #[test]
     fn rejects_lengths() {
         for n in [0u32, 3, MAX_FRAME as u32 + 1, u32::MAX] {
-            let mut b = BytesMut::from(&[b'Q'][..]);
+            let mut b = BytesMut::from(&b"Q"[..]);
             b.extend_from_slice(&n.to_be_bytes());
             assert!(decode(&mut b).is_err());
         }
